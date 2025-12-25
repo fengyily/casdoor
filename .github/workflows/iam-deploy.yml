@@ -1,0 +1,387 @@
+name: Casdoor IAM Deploy
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'casdoor/**'
+      - '.github/workflows/iam-deploy.yml'
+    tags: [ 'iam-v*' ]
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'casdoor/**'
+      - '.github/workflows/iam-deploy.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: '部署环境'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: fengyily/casdoor-iam
+  CASDOOR_VERSION: latest
+  CASDOOR_DOMAIN: iam.appsheild.net
+  CASDOOR_URL: https://iam.appsheild.net
+
+jobs:
+  # 代码检查和测试
+  lint-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./casdoor
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+        cache-dependency-path: casdoor/go.sum
+        
+    - name: Go mod download
+      run: go mod download
+      
+    - name: Run go vet
+      run: go vet ./...
+      
+    - name: Run tests
+      run: |
+        go test -v -race -coverprofile=coverage.out ./...
+      continue-on-error: true
+      
+    - name: Upload coverage
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: casdoor/coverage.out
+        retention-days: 7
+
+  # 构建 Docker 镜像
+  build:
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Log in to Container Registry
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}},prefix=iam-
+          type=semver,pattern={{major}}.{{minor}},prefix=iam-
+          type=sha,prefix=sha-
+          type=raw,value=latest,enable={{is_default_branch}}
+        flavor: |
+          latest=auto
+          
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: ./casdoor
+        file: ./casdoor/Dockerfile
+        platforms: linux/amd64,linux/arm64
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        provenance: false
+        sbom: false
+        build-args: |
+          BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          VCS_REF=${{ github.sha }}
+          VERSION=${{ steps.meta.outputs.version }}
+
+  # 部署到服务器
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/iam-v'))
+    environment:
+      name: ${{ github.event.inputs.environment || 'staging' }}
+      url: ${{ vars.CASDOOR_URL }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Create deployment files
+      run: |
+        mkdir -p deploy
+        
+        # 创建 docker-compose 生产配置
+        cat > deploy/docker-compose.yml << 'EOF'
+        version: '3.8'
+        
+        services:
+          casdoor:
+            container_name: casdoor-server
+            image: ${DOCKER_IMAGE}:${IMAGE_TAG:-latest}
+            restart: always
+            entrypoint: /bin/sh -c './server --createDatabase=true'
+            ports:
+              - "8000:8000"
+            depends_on:
+              postgres:
+                condition: service_healthy
+            environment:
+              RUNNING_IN_DOCKER: "true"
+            volumes:
+              - ./conf/app.conf:/conf/app.conf:ro
+              - casdoor-logs:/logs
+            networks:
+              - casdoor-network
+            healthcheck:
+              test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+              interval: 30s
+              timeout: 10s
+              retries: 3
+              start_period: 60s
+        
+          postgres:
+            container_name: casdoor-postgres
+            image: postgres:15-alpine
+            restart: always
+            environment:
+              POSTGRES_USER: ${POSTGRES_USER}
+              POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+              POSTGRES_DB: ${POSTGRES_DB}
+              PGDATA: /var/lib/postgresql/data/pgdata
+            volumes:
+              - postgres-data:/var/lib/postgresql/data
+            networks:
+              - casdoor-network
+            healthcheck:
+              test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+              interval: 10s
+              timeout: 5s
+              retries: 5
+              start_period: 10s
+        
+        volumes:
+          postgres-data:
+            driver: local
+          casdoor-logs:
+            driver: local
+        
+        networks:
+          casdoor-network:
+            driver: bridge
+        EOF
+        
+        # 创建部署脚本
+        cat > deploy/deploy.sh << 'DEPLOY_EOF'
+        #!/bin/bash
+        set -e
+        
+        DEPLOY_DIR="/opt/casdoor"
+        
+        echo "🚀 开始部署 Casdoor..."
+        
+        # 创建部署目录
+        sudo mkdir -p $DEPLOY_DIR/conf
+        
+        # 复制配置文件
+        sudo cp /tmp/docker-compose.yml $DEPLOY_DIR/
+        sudo cp /tmp/app.conf $DEPLOY_DIR/conf/
+        
+        cd $DEPLOY_DIR
+        
+        # 登录到 GitHub Container Registry
+        echo "$GITHUB_TOKEN" | sudo docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        
+        # 拉取最新镜像
+        sudo docker-compose pull casdoor
+        
+        # 停止旧容器并启动新容器
+        sudo docker-compose down --remove-orphans || true
+        sudo docker-compose up -d
+        
+        # 等待服务启动
+        echo "⏳ 等待服务启动..."
+        sleep 30
+        
+        # 健康检查
+        for i in {1..10}; do
+          if curl -sf http://localhost:8000/api/health > /dev/null 2>&1; then
+            echo "✅ Casdoor 服务已成功启动!"
+            exit 0
+          fi
+          echo "等待服务就绪... ($i/10)"
+          sleep 10
+        done
+        
+        echo "❌ 服务启动超时，请检查日志"
+        sudo docker-compose logs --tail=50
+        exit 1
+        DEPLOY_EOF
+        
+        chmod +x deploy/deploy.sh
+        
+    - name: Generate production config
+      run: |
+        cat > deploy/app.conf << EOF
+        appname = casdoor
+        httpport = 8000
+        runmode = prod
+        copyrequestbody = true
+        
+        # PostgreSQL 数据库配置
+        driverName = postgres
+        dataSourceName = "user=${POSTGRES_USER} password=${POSTGRES_PASSWORD} host=postgres port=5432 sslmode=disable dbname=${POSTGRES_DB}"
+        dbName = ${POSTGRES_DB}
+        
+        tableNamePrefix =
+        showSql = false
+        redisEndpoint =
+        defaultStorageProvider =
+        isCloudIntranet = false
+        authState = "casdoor"
+        socks5Proxy = ""
+        verificationCodeTimeout = 10
+        initScore = 0
+        logPostOnly = true
+        isUsernameLowered = false
+        origin = "https://iam.appsheild.net"
+        originFrontend = "https://iam.appsheild.net"
+        staticBaseUrl = "https://cdn.casbin.org"
+        isDemoMode = false
+        batchSize = 100
+        enableErrorMask = true
+        enableGzip = true
+        inactiveTimeoutMinutes =
+        ldapServerPort = 389
+        ldapsCertId = ""
+        ldapsServerPort = 636
+        radiusServerPort = 1812
+        radiusDefaultOrganization = "built-in"
+        radiusSecret = "${RADIUS_SECRET:-secret}"
+        quota = {"organization": -1, "user": -1, "application": -1, "provider": -1}
+        logConfig = {"adapter":"file", "filename": "logs/casdoor.log", "maxdays":99999, "perm":"0770"}
+        initDataNewOnly = false
+        initDataFile = "./init_data.json"
+        frontendBaseDir = "../cc_0"
+        EOF
+      env:
+        POSTGRES_USER: ${{ secrets.POSTGRES_USER || 'casdoor' }}
+        POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        POSTGRES_DB: ${{ secrets.POSTGRES_DB || 'casdoor' }}
+        RADIUS_SECRET: ${{ secrets.RADIUS_SECRET }}
+        
+    - name: Deploy to Server
+      env:
+        SERVER_HOST: ${{ secrets.IAM_SERVER_HOST }}
+        SERVER_USER: ${{ secrets.IAM_SERVER_USER }}
+        SERVER_SSH_KEY: ${{ secrets.IAM_SERVER_SSH_KEY }}
+        DOCKER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
+        POSTGRES_USER: ${{ secrets.POSTGRES_USER || 'casdoor' }}
+        POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        POSTGRES_DB: ${{ secrets.POSTGRES_DB || 'casdoor' }}
+        GITHUB_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        GITHUB_ACTOR: ${{ github.actor }}
+      run: |
+        # 配置 SSH
+        mkdir -p ~/.ssh
+        echo "$SERVER_SSH_KEY" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H $SERVER_HOST >> ~/.ssh/known_hosts
+        
+        echo "🚀 部署到 $SERVER_HOST..."
+        
+        # 上传部署文件
+        scp deploy/docker-compose.yml $SERVER_USER@$SERVER_HOST:/tmp/
+        scp deploy/app.conf $SERVER_USER@$SERVER_HOST:/tmp/
+        scp deploy/deploy.sh $SERVER_USER@$SERVER_HOST:/tmp/
+        
+        # 执行部署
+        ssh $SERVER_USER@$SERVER_HOST "
+          export DOCKER_IMAGE='$DOCKER_IMAGE'
+          export IMAGE_TAG='$IMAGE_TAG'
+          export POSTGRES_USER='$POSTGRES_USER'
+          export POSTGRES_PASSWORD='$POSTGRES_PASSWORD'
+          export POSTGRES_DB='$POSTGRES_DB'
+          export GITHUB_TOKEN='$GITHUB_TOKEN'
+          export GITHUB_ACTOR='$GITHUB_ACTOR'
+          chmod +x /tmp/deploy.sh
+          /tmp/deploy.sh
+        "
+        
+        # 清理 SSH 密钥
+        rm -f ~/.ssh/id_rsa
+        
+        echo "✅ 部署完成!"
+        
+    - name: Notify deployment status
+      if: always()
+      run: |
+        if [ "${{ job.status }}" == "success" ]; then
+          echo "✅ Casdoor IAM 部署成功!"
+          echo "🔗 访问地址: ${{ vars.CASDOOR_URL }}"
+        else
+          echo "❌ Casdoor IAM 部署失败，请检查日志"
+        fi
+
+  # 安全扫描
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image-tag }}
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        severity: 'CRITICAL,HIGH'
+      continue-on-error: true
+      
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: 'trivy-results.sarif'
+      continue-on-error: true
+
