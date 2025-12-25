@@ -1,0 +1,70 @@
+# Casdoor 生产环境 Docker Compose 配置
+# 访问地址: https://iam.appsheild.net
+version: '3.8'
+
+services:
+  casdoor:
+    container_name: casdoor-server
+    image: ${DOCKER_IMAGE:-ghcr.io/fengyily/casdoor-iam}:${IMAGE_TAG:-latest}
+    restart: always
+    entrypoint: /bin/sh -c './server --createDatabase=true'
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RUNNING_IN_DOCKER: "true"
+    volumes:
+      - ./conf/app.conf:/conf/app.conf:ro
+      - casdoor-logs:/logs
+    networks:
+      - casdoor-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+  postgres:
+    container_name: casdoor-postgres
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-casdoor}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-casdoor}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./backup:/backup
+    networks:
+      - casdoor-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-casdoor} -d ${POSTGRES_DB:-casdoor}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+volumes:
+  postgres-data:
+    driver: local
+  casdoor-logs:
+    driver: local
+
+networks:
+  casdoor-network:
+    driver: bridge
+

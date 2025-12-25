@@ -1,0 +1,87 @@
+# Casdoor 本地开发环境 (PostgreSQL)
+# 使用方式: docker-compose -f docker-compose.local.yml up -d
+version: '3.8'
+
+services:
+  casdoor:
+    container_name: casdoor-server
+    restart: always
+    build:
+      context: ./
+      dockerfile: Dockerfile
+      target: STANDARD
+    entrypoint: /bin/sh -c './server --createDatabase=true'
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RUNNING_IN_DOCKER: "true"
+    volumes:
+      - ./conf/app.local.conf:/conf/app.conf:ro
+      - casdoor-logs:/logs
+    networks:
+      - casdoor-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  postgres:
+    container_name: casdoor-postgres
+    image: postgres:15-alpine
+    restart: always
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-casdoor}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-casdoor123}
+      POSTGRES_DB: ${POSTGRES_DB:-casdoor}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d:ro
+    networks:
+      - casdoor-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-casdoor} -d ${POSTGRES_DB:-casdoor}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # 可选: pgAdmin 数据库管理工具
+  pgadmin:
+    container_name: casdoor-pgadmin
+    image: dpage/pgadmin4:latest
+    restart: unless-stopped
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@casdoor.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin123}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    networks:
+      - casdoor-network
+    depends_on:
+      - postgres
+    profiles:
+      - tools
+
+volumes:
+  postgres-data:
+    driver: local
+  pgadmin-data:
+    driver: local
+  casdoor-logs:
+    driver: local
+
+networks:
+  casdoor-network:
+    driver: bridge
+
