@@ -3,21 +3,15 @@ name: Casdoor IAM Deploy
 on:
   push:
     branches: [ main, master ]
-    paths:
-      - 'casdoor/**'
-      - '.github/workflows/iam-deploy.yml'
-    tags: [ 'iam-v*' ]
+    tags: [ 'v*' ]
   pull_request:
     branches: [ main, master ]
-    paths:
-      - 'casdoor/**'
-      - '.github/workflows/iam-deploy.yml'
   workflow_dispatch:
     inputs:
       environment:
         description: '部署环境'
         required: true
-        default: 'staging'
+        default: 'production'
         type: choice
         options:
           - staging
@@ -38,9 +32,6 @@ jobs:
   # 代码检查和测试
   lint-and-test:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./casdoor
     
     steps:
     - name: Checkout code
@@ -50,7 +41,7 @@ jobs:
       uses: actions/setup-go@v5
       with:
         go-version: '1.21'
-        cache-dependency-path: casdoor/go.sum
+        cache-dependency-path: go.sum
         
     - name: Go mod download
       run: go mod download
@@ -67,7 +58,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: coverage-report
-        path: casdoor/coverage.out
+        path: coverage.out
         retention-days: 7
 
   # 构建 Docker 镜像
@@ -104,8 +95,8 @@ jobs:
         tags: |
           type=ref,event=branch
           type=ref,event=pr
-          type=semver,pattern={{version}},prefix=iam-
-          type=semver,pattern={{major}}.{{minor}},prefix=iam-
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
           type=sha,prefix=sha-
           type=raw,value=latest,enable={{is_default_branch}}
         flavor: |
@@ -115,8 +106,8 @@ jobs:
       id: build
       uses: docker/build-push-action@v5
       with:
-        context: ./casdoor
-        file: ./casdoor/Dockerfile
+        context: .
+        file: ./Dockerfile
         platforms: linux/amd64,linux/arm64
         push: ${{ github.event_name != 'pull_request' }}
         tags: ${{ steps.meta.outputs.tags }}
@@ -134,10 +125,10 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     needs: build
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/iam-v'))
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
     environment:
-      name: ${{ github.event.inputs.environment || 'staging' }}
-      url: ${{ vars.CASDOOR_URL }}
+      name: ${{ github.event.inputs.environment || 'production' }}
+      url: https://iam.appsheild.net
     
     steps:
     - name: Checkout code
@@ -158,7 +149,7 @@ jobs:
             restart: always
             entrypoint: /bin/sh -c './server --createDatabase=true'
             ports:
-              - "8000:8000"
+              - "127.0.0.1:8000:8000"
             depends_on:
               postgres:
                 condition: service_healthy
@@ -225,15 +216,24 @@ jobs:
         
         cd $DEPLOY_DIR
         
+        # 创建环境变量文件
+        sudo tee .env > /dev/null << ENV_EOF
+        DOCKER_IMAGE=$DOCKER_IMAGE
+        IMAGE_TAG=$IMAGE_TAG
+        POSTGRES_USER=$POSTGRES_USER
+        POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+        POSTGRES_DB=$POSTGRES_DB
+        ENV_EOF
+        
         # 登录到 GitHub Container Registry
         echo "$GITHUB_TOKEN" | sudo docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
         
         # 拉取最新镜像
-        sudo docker-compose pull casdoor
+        sudo docker compose pull casdoor
         
         # 停止旧容器并启动新容器
-        sudo docker-compose down --remove-orphans || true
-        sudo docker-compose up -d
+        sudo docker compose down --remove-orphans || true
+        sudo docker compose up -d
         
         # 等待服务启动
         echo "⏳ 等待服务启动..."
@@ -250,7 +250,7 @@ jobs:
         done
         
         echo "❌ 服务启动超时，请检查日志"
-        sudo docker-compose logs --tail=50
+        sudo docker compose logs --tail=50
         exit 1
         DEPLOY_EOF
         
@@ -259,7 +259,7 @@ jobs:
     - name: Generate production config
       run: |
         cat > deploy/app.conf << EOF
-        appname = casdoor
+        appname = App Sheild
         httpport = 8000
         runmode = prod
         copyrequestbody = true
@@ -274,7 +274,7 @@ jobs:
         redisEndpoint =
         defaultStorageProvider =
         isCloudIntranet = false
-        authState = "casdoor"
+        authState = "appsheild"
         socks5Proxy = ""
         verificationCodeTimeout = 10
         initScore = 0
@@ -355,7 +355,7 @@ jobs:
       run: |
         if [ "${{ job.status }}" == "success" ]; then
           echo "✅ Casdoor IAM 部署成功!"
-          echo "🔗 访问地址: ${{ vars.CASDOOR_URL }}"
+          echo "🔗 访问地址: https://iam.appsheild.net"
         else
           echo "❌ Casdoor IAM 部署失败，请检查日志"
         fi
@@ -384,4 +384,3 @@ jobs:
       with:
         sarif_file: 'trivy-results.sarif'
       continue-on-error: true
-
