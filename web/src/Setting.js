@@ -32,7 +32,7 @@ const {Option} = Select;
 
 export const ServerUrl = "";
 
-export const StaticBaseUrl = "https://cdn.casbin.org";
+export const StaticBaseUrl = "";
 
 export const Countries = [
   {label: "English", key: "en", country: "US", alt: "English"},

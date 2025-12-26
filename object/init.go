@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/beego/beego"
 	"github.com/casdoor/casdoor/conf"
 	"github.com/casdoor/casdoor/util"
 	"github.com/go-webauthn/webauthn/webauthn"
@@ -97,7 +98,7 @@ func initBuiltInOrganization() bool {
 		Name:               "built-in",
 		CreatedTime:        util.GetCurrentTime(),
 		DisplayName:        "Built-in Organization",
-		WebsiteUrl:         "https://example.com",
+		WebsiteUrl:         beego.AppConfig.String("origin"),
 		Favicon:            fmt.Sprintf("%s/img/casbin/favicon.ico", conf.GetConfigString("staticBaseUrl")),
 		PasswordType:       "plain",
 		PasswordOptions:    []string{"AtLeast6"},
@@ -174,7 +175,7 @@ func initBuiltInApplication() {
 		Owner:          "admin",
 		Name:           "app-built-in",
 		CreatedTime:    util.GetCurrentTime(),
-		DisplayName:    "Casdoor",
+		DisplayName:    beego.AppConfig.String("appname"),
 		Logo:           fmt.Sprintf("%s/img/casdoor-logo_1185x256.png", conf.GetConfigString("staticBaseUrl")),
 		HomepageUrl:    "https://casdoor.org",
 		Organization:   "built-in",

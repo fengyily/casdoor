@@ -18,6 +18,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/beego/beego"
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 )
@@ -34,11 +35,10 @@ type TotpMfa struct {
 }
 
 func (mfa *TotpMfa) Initiate(userId string) (*MfaProps, error) {
-	//issuer := beego.AppConfig.String("appname")
-	//if issuer == "" {
-	//	issuer = "casdoor"
-	//}
-	issuer := "Casdoor"
+	issuer := beego.AppConfig.String("appname")
+	if issuer == "" {
+		issuer = "App Sheild"
+	}
 
 	key, err := totp.Generate(totp.GenerateOpts{
 		Issuer:      issuer,
